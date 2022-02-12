@@ -1,0 +1,511 @@
+---
+# Inspiration:
+# https://github.com/mrmierzejewski/ansible-bootstrap-ubuntu
+# https://gist.github.com/perrygeo/7273812
+- name: deploy my dev stack
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  become: yes
+  become_user: root
+
+  vars:
+      my_user: ubuntu
+      new_sshd_port: 22
+      # github_user: SET_IT
+      # dotfiles_repo: SET_IT
+      dotfiles_dir: ".dotfiles"
+
+  # https://docs.ansible.com/ansible/latest/collections/ansible/builtin/index.html#plugins-in-ansible-builtin
+  tasks:
+      # Packages (into)
+
+      - name: Get aptitude for upgrade
+        apt: pkg=aptitude state=present
+
+      - name: Get ca-certificates
+        apt: pkg=ca-certificates state=present
+
+      - name: update certs
+        shell: 'apt-get install --reinstall -y ca-certificates && update-ca-certificates -f'
+
+      - name: Update repository list and cache
+        apt: update_cache=yes cache_valid_time=3600
+
+      - name: Upgrade all packages on the Cloud Server
+        apt: upgrade=yes
+
+      # Locale
+
+      - name: Ensure the locale exists
+        locale_gen:
+            name: en_US.UTF-8
+            state: present
+
+      - name: set as default locale
+        command: localectl set-locale LANG=en_US.UTF-8
+
+      # Core cli utils
+
+      - name: Install core cli utils packages
+        apt:
+            name:
+                - traceroute
+                - htop
+                - wget
+                - curl
+                - git
+                - apt-transport-https
+                - gnupg
+                - debian-archive-keyring
+                - software-properties-common
+                - zip
+                - unzip
+            state: latest
+
+      # User settings
+
+      - name: sudoers for authkey-only auth
+        lineinfile: "dest=/etc/sudoers regexp='^%sudo' line='%sudo ALL=(ALL:ALL) NOPASSWD: ALL'"
+
+      - name: add admin user accounts
+        user:
+          name: "{{ my_user }}"
+          shell: /bin/bash
+          groups:
+            - sudo
+            - adm
+            - dialout
+            - cdrom
+            - floppy
+            - audio
+            - dip
+            - video
+            - plugdev
+            - lxd
+          append: yes
+
+      # SSH
+      - name: configure ssh
+        block:
+        - name: add pubkeys from GitHub
+          authorized_key: user={{ my_user }} key=https://github.com/{{ github_user }}.keys
+
+        - name: Setup alternate SSH port
+          lineinfile:
+            regexp: '^Port'
+            line: 'Port {{new_sshd_port}}'
+            dest: /etc/ssh/sshd_config
+            state: present
+            firstmatch: yes
+            insertafter: EOF
+          notify: restart SSH
+
+        - name: disable SSH password auth
+          lineinfile:
+            regexp: '^PasswordAuthentication '
+            line: 'PasswordAuthentication no'
+            dest: /etc/ssh/sshd_config
+            state: present
+            firstmatch: yes
+            insertafter: EOF
+          notify: restart SSH
+
+        - name: disable SSH root logins
+          lineinfile:
+            regexp: '^PermitRootLogin '
+            line: 'PermitRootLogin no'
+            dest: /etc/ssh/sshd_config
+            state: present
+            firstmatch: yes
+            insertafter: EOF
+          notify: restart SSH
+
+        - name: disable SSH empty passwords
+          lineinfile:
+            regexp: '^PermitEmptyPasswords '
+            line: 'PermitEmptyPasswords yes'
+            dest: /etc/ssh/sshd_config
+            state: present
+            firstmatch: yes
+            insertafter: EOF
+          notify: restart SSH
+
+        - name: allow SSH specific users
+          lineinfile:
+            regexp: '^AllowUsers '
+            line: 'AllowUsers {{ my_user }}'
+            dest: /etc/ssh/sshd_config
+            state: present
+            firstmatch: yes
+            insertafter: EOF
+          notify: restart SSH
+
+        - name: set SSH protocol
+          lineinfile:
+            regexp: '^Protocol '
+            line: 'Protocol 2'
+            dest: /etc/ssh/sshd_config
+            state: present
+            firstmatch: yes
+            insertafter: EOF
+          notify: restart SSH
+
+        - name: restart sshd
+          shell: systemctl reload sshd
+
+        - name: install fail2ban
+          apt: name=fail2ban update_cache=yes state=latest
+          notify: restart fail2ban
+
+        - name: ensure fail2ban enabled
+          service: name=fail2ban enabled=yes
+
+        - name: set default ufw policy
+          ufw: state=enabled policy=reject
+
+        - name: add SSH ufw rule
+          ufw: name=OpenSSH rule=allow port={{new_sshd_port}}
+
+          # WTF: why uwf not works?
+        - name: add SSH ufw rule SECOND
+          shell: ufw allow {{new_sshd_port}}
+
+        # TODO: RESTART SSH? оно на старом порту висит
+
+      # Install shell & dotfiles
+      - name: install fish and dotfiles
+        block:
+        - name: add fish shell ppa
+          apt_repository:
+            repo: ppa:fish-shell/release-3
+
+        - name: install fish shell
+          apt:
+              name: fish
+              state: latest
+
+        - name: change user default shell
+          user:
+            name: "{{ my_user }}"
+            shell: /usr/bin/fish
+
+        - name: ensure github.com is a known host
+          become_user: "{{ my_user }}"
+          lineinfile:
+            dest: /home/{{ my_user }}/.ssh/known_hosts
+            create: yes
+            state: present
+            line: "{{ lookup('pipe', 'ssh-keyscan -t rsa github.com') }}"
+            regexp: "^github\\.com"
+
+        - name: install oh-my-fish
+          become_user: "{{ my_user }}"
+          shell: |
+            curl https://raw.githubusercontent.com/oh-my-fish/oh-my-fish/master/bin/install > install;
+            fish install \
+                --path=~/.local/share/omf \
+                --config=~/.config/omf \
+                --noninteractive --yes;
+            rm install;
+
+        - name: Check dotfiles directory
+          become_user: "{{ my_user }}"
+          stat:
+            path: $HOME/{{dotfiles_dir}}
+          register: dotfiles_directory
+
+        - name: is dotfiles cloned?
+          debug: var=dotfiles_directory
+
+        - name: Install dotfiles
+          become_user: "{{ my_user }}"
+          when: not dotfiles_directory.stat.exists
+          shell: |
+            git clone \
+                --separate-git-dir="$HOME/{{dotfiles_dir}}" \
+                {{dotfiles_repo}} $HOME/myconf-tmp || exit 1
+            git --git-dir="$HOME/{{dotfiles_dir}}" --work-tree=$HOME checkout --force;
+            rm -rf myconf-tmp/;
+
+        - name: Install omf plugins
+          become_user: "{{ my_user }}"
+          shell: fish --login -c 'omf install'
+
+      # Python
+      - name: python
+        block:
+          - name: Install generic python packages
+            # https://gist.github.com/Adron/37519aa6cf086ec15b640b660cd0deaf
+            # https://py-generic-project.readthedocs.io/en/latest/installing.html
+            apt:
+                name:
+                  - build-essential
+                  - checkinstall
+                  - libffi-dev
+                  - libncursesw5-dev
+                  - libssl-dev
+                  - libsqlite3-dev
+                  - tk-dev
+                  - libgdbm-dev
+                  - libc6-dev
+                  - libbz2-dev
+                  - python3-dev
+                  - python3-pip
+                  - python3-venv
+                state: latest
+
+          - name: Install python3 pip
+            become_user: "{{ my_user }}"
+            shell: |
+              python3 -m pip install --user pipx && \
+              python3 -m pipx ensurepath
+
+          # pyenv
+          - name: Install generic python packages
+            # https://github.com/pyenv/pyenv#the-automatic-installer
+            # https://github.com/pyenv/pyenv/wiki#suggested-build-environment
+            apt:
+                name:
+                  - make
+                  - build-essential
+                  - libssl-dev
+                  - zlib1g-dev
+                  - libbz2-dev
+                  - libreadline-dev
+                  - libsqlite3-dev
+                  - wget
+                  - curl
+                  - llvm
+                  - libncursesw5-dev
+                  - xz-utils
+                  - tk-dev
+                  - libxml2-dev
+                  - libxmlsec1-dev
+                  - libffi-dev
+                  - liblzma-dev
+                state: latest
+
+          - name: Check pyenv directory
+            become_user: "{{ my_user }}"
+            stat:
+              path: $HOME/.pyenv
+            register: pyenv_directory
+
+          - name: is pyenv installed?
+            debug: var=pyenv_directory
+
+          - name: Install pyenv
+            become_user: "{{ my_user }}"
+            when: not pyenv_directory.stat.exists
+            shell: curl https://pyenv.run | bash
+
+          - name: Install latest python version
+            # https://stackoverflow.com/a/70290979/3278855
+            become_user: "{{ my_user }}"
+            shell: fish --login -c 'pyenv install 3:latest --skip-existing'
+
+          - name: Install pipx
+            # https://github.com/pypa/pipx#install-pipx
+            become_user: "{{ my_user }}"
+            shell: |
+              python3 -m pip install --user pipx && \
+              python3 -m pipx ensurepath
+
+      - name: configure pipx packages
+        block:
+          - name: Install pipx packages
+            become_user: "{{ my_user }}"
+            shell:
+              executable: /usr/bin/fish
+              cmd: |
+                pipx install bpytop && \
+                pipx install poetry
+
+          - name: Configure poetry
+            become_user: "{{ my_user }}"
+            shell:
+              executable: /usr/bin/fish
+              cmd: |
+                poetry config virtualenvs.in-project true && \
+                poetry config experimental.new-installer false
+
+      - name: configure python plotting
+        block:
+          - name: install additional plotting packages
+            apt:
+              name:
+                - libgl1-mesa-glx
+                - libegl1-mesa
+                - libxrandr2
+                - libxrandr2
+                - libxss1
+                - libxcursor1
+                - libxcomposite1
+                - libasound2
+                - libxi6
+                - libxtst6
+              state: latest
+
+          - name: install chrome
+            block:
+              - name: Install apt-transport-https
+                ansible.builtin.apt:
+                  state: latest
+                  update_cache: true
+              - name: Add Apt signing key
+                ansible.builtin.apt_key:
+                  url: "https://dl.google.com/linux/linux_signing_key.pub"
+                  state: present
+              - name: Add repository into sources list
+                ansible.builtin.apt_repository:
+                  repo: deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main
+                  state: present
+                  filename: google-chrome
+              - name: Install google-chrome-stable
+                ansible.builtin.apt:
+                  name: "google-chrome-stable"
+                  state: latest
+                  update_cache: true
+
+      # Install extra cli apps
+      - name: Install extra cli apps
+        block:
+          - name: add ppa for diff-so-fancy
+            # https://github.com/so-fancy/diff-so-fancy#install
+            apt_repository:
+              repo: ppa:aos1/diff-so-fancy
+
+          - name: Install diff-so-fancy
+            apt:
+                name: diff-so-fancy
+                state: latest
+
+          - name: Install exa
+            # https://github.com/ogham/exa#installation
+            # apt:
+            #     name: exa
+            #     state: latest
+            shell: |
+              EXA_VERSION=$(curl -s "https://api.github.com/repos/ogham/exa/releases/latest" | grep -Po '"tag_name": "v\K[0-9.]+')
+              curl -Lo exa.zip "https://github.com/ogham/exa/releases/latest/download/exa-linux-x86_64-v${EXA_VERSION}.zip"
+              unzip -q exa.zip bin/exa -d /usr/local
+
+
+
+          - name: Install icdiff
+            become_user: "{{ my_user }}"
+            # https://github.com/jeffkaufman/icdiff#installation
+            shell: ~/.local/bin/pipx install icdiff
+
+          - name: Install tmux htop httpie fzf tmux neofetch starship
+            apt:
+                name:
+                  - htop
+                  - httpie
+                  - fzf
+                  - neovim
+                  - tmux
+                  - neofetch
+                state: latest
+
+          - name: Install bat ripgrep
+            shell: apt install -y -o Dpkg::Options::="--force-overwrite" bat ripgrep
+
+          - name: Install nvim plugins
+            become_user: "{{ my_user }}"
+            shell: fish --login -c 'nvim --headless +PlugInstall +qall'
+
+          - name: Link bat
+            become_user: "{{ my_user }}"
+            shell: mkdir -p ~/.local/bin && ln -sf /usr/bin/batcat ~/.local/bin/bat
+
+          - name: Install zoxide
+            become_user: "{{ my_user }}"
+            shell: curl -sS https://webinstall.dev/zoxide | bash
+
+          - name: Install starship
+            become_user: "{{ my_user }}"
+            shell: |
+              curl -fsSL https://starship.rs/install.sh -o ~/install.sh && \
+              chmod +x ~/install.sh && \
+              ~/install.sh --force --yes && \
+              rm ~/install.sh
+
+          - name: Install shfmt
+            become_user: "{{ my_user }}"
+            shell: curl -sS https://webinstall.dev/shfmt | bash
+
+      # Install docker
+      - name: install docker
+        block:
+          - name: remove old docker installations
+            # https://docs.docker.com/engine/install/ubuntu/
+            apt:
+                name:
+                  - docker
+                  - docker-engine
+                  - docker.io
+                  - containerd
+                  - runc
+                state: absent
+
+          - name: install docker certificates
+            # https://docs.docker.com/engine/install/ubuntu/
+            apt:
+                name:
+                  - ca-certificates
+                  - curl
+                  - gnupg
+                  - lsb-release
+                state: latest
+
+          - name: add docker key
+            # https://docs.docker.com/engine/install/ubuntu/
+            shell:  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --always-trust --batch --yes --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+          - name: add docker repo
+            # https://docs.docker.com/engine/install/ubuntu/
+            shell: echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+          - name: install docker engine
+            # https://docs.docker.com/engine/install/ubuntu/
+            shell: |
+              apt-get update && \
+              apt-get install -y docker-ce docker-ce-cli containerd.io
+
+          - name: add user into docker group
+            # # https://docs.docker.com/engine/install/linux-postinstall/#manage-docker-as-a-non-root-user
+            user:
+              name: "{{ my_user }}"
+              groups:
+                - docker
+              append: yes
+
+            # https://docs.docker.com/config/daemon/ipv6/ ?
+
+          - name: install docker-compose
+            # https://docs.docker.com/compose/install/
+            shell: |
+              curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose && \
+              chmod +x /usr/local/bin/docker-compose && \
+              ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+
+          - name: Run docker hello world
+            become_user: "{{ my_user }}"
+            shell: fish --login -c 'docker run hello-world'
+
+      - name: Remove useless packages from the cache
+        apt:
+            autoclean: yes
+
+      - name: Remove dependencies that are no longer required
+        apt:
+            autoremove: yes
+
+  handlers:
+      - name: restart fail2ban
+        action: service name=fail2ban state=restarted
+
+      - name: restart SSH
+        action: service name=ssh state=restarted
