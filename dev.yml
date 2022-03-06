@@ -61,6 +61,9 @@
                 - software-properties-common
                 - zip
                 - unzip
+                - direnv
+                - keychain
+                - duf # https://github.com/muesli/duf
             state: latest
 
       # User settings
@@ -232,6 +235,16 @@
           become_user: "{{ my_user }}"
           shell: fish --login -c 'omf install'
 
+      # NodeJS
+      - name: nodejs
+        block:
+          - name: install nvm
+            become_user: "{{ my_user }}"
+            shell: >
+              curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.1/install.sh | bash
+            args:
+              creates: "{{ ansible_env.HOME }}/.nvm/nvm.sh"
+
       # Python
       - name: python
         block:
@@ -319,6 +332,7 @@
             shell:
               executable: /usr/bin/fish
               cmd: |
+                pipx install snakeviz && \
                 pipx install bpytop && \
                 pipx install poetry
 
